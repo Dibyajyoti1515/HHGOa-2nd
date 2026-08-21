@@ -1,0 +1,104 @@
+# ============================================================
+# docker-compose.yml
+#
+# Services:
+#   qdrant     - vector DB (persisted via named volume)
+#   backend    - FastAPI voice/retrieval API (project.api.app:app)
+#   frontend   - React/Vite dev server
+#   ingestion  - one-shot job to build the Qdrant collection.
+#                Does NOT start with `docker compose up` -- it's
+#                behind the "ingestion" profile, so it only runs
+#                when you explicitly ask for it (see usage below).
+#
+# All state that needs to survive container restarts (unified
+# corpus parquet, SQLite native lookup, logs, generated TTS audio)
+# lives in the shared "app_state" volume, mounted at /app/state in
+# both "backend" and "ingestion" -- so whatever ingestion writes,
+# the backend can immediately read.
+# ============================================================
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: hhgoa-qdrant
+    ports:
+      - "6333:6333"   # REST
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hhgoa-backend
+    env_file:
+      - .env
+    environment:
+      # Points the app at the "qdrant" service (Docker's internal DNS),
+      # overriding whatever QDRANT_URL is set to in .env for local dev.
+      QDRANT_URL: http://qdrant:6333
+      # Redirect all generated/writable state into the shared volume.
+      UNIFIED_FILE: /app/state/unified_corpus.parquet
+      SQLITE_DB: /app/state/native_text_lookup.db
+      LOG_DIR: /app/state/logs
+      TTS_OUTPUT_DIR: /app/state/tts_out
+    ports:
+      - "8000:8000"
+    volumes:
+      - app_state:/app/state
+      - hf_cache:/root/.cache/huggingface
+      - fastembed_cache:/app/fastembed_cache
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hhgoa-ingestion
+    entrypoint: ["./docker/entrypoint-ingestion.sh"]
+    # Adjust these flags if your project/scripts/run_ingestion.py
+    # takes different arguments -- see the note in
+    # docker/entrypoint-ingestion.sh.
+    command: ["--input", "/app/source_data/hintrain.parquet", "--lang", "en"]
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      UNIFIED_FILE: /app/state/unified_corpus.parquet
+      SQLITE_DB: /app/state/native_text_lookup.db
+      LOG_DIR: /app/state/logs
+    volumes:
+      - app_state:/app/state
+      - hf_cache:/root/.cache/huggingface
+      - fastembed_cache:/app/fastembed_cache
+      # Put your raw source parquet(s) (e.g. MSMARCO-XI/train/hintrain.parquet)
+      # on the host under ./source_data before running this service.
+      - ./source_data:/app/source_data:ro
+    depends_on:
+      - qdrant
+    profiles:
+      - ingestion   # excluded from `docker compose up`; run explicitly, see usage notes
+
+  frontend:
+    build:
+      context: ./Frontend
+      dockerfile: Dockerfile
+    container_name: hhgoa-frontend
+    environment:
+      VITE_API_BASE: http://localhost:8000
+      VITE_WS_BASE: ws://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  qdrant_storage:
+  app_state:
+  hf_cache:
+  fastembed_cache:

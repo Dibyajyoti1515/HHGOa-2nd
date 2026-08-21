@@ -1,0 +1,34 @@
+# VCS / IDE
+.git
+.idea
+
+# Python envs / caches
+mlenv
+**/__pycache__
+*.pyc
+
+# Notebooks & test/report artifacts -- not needed at runtime
+Notebooks
+Test report
+Update_version_test_data
+update_version_2
+Update_Claude.MD
+report.md
+name.txt
+
+# Large datasets & generated state -- provided/created via volumes, not baked into the image
+MSMARCO-XI
+qdrant_storage
+hf_cache
+fastembed_cache
+logs
+tts_out
+*.parquet
+*.db
+
+# Secrets
+.env
+
+# Frontend build artifacts (Frontend/Dockerfile has its own .dockerignore too)
+Frontend/node_modules
+Frontend/dist
