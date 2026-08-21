@@ -1,0 +1,14 @@
+# guardrails/wordlists/profanity.txt
+#
+# OPEN ITEM — see CLAUDE.md Section 3: "Prompt-injection / PII / profanity
+# detection method: rule/regex-based ... vs. a small classifier/library."
+# Defaulting to rule-based per CLAUDE.md's stated default, but a rule-based
+# profanity check is only as good as its wordlist, and no wordlist was
+# supplied. This file ships EMPTY on purpose — the profanity check is a
+# no-op (always passes) until this file has real entries, or until the
+# user decides to swap the whole check for a moderation library instead
+# (see the DETECTION_METHOD note in input_guardrails.py).
+#
+# Format: one word/phrase per line, lowercase. Blank lines and lines
+# starting with '#' are ignored. Matching is case-insensitive
+# whole-word matching against the query text.

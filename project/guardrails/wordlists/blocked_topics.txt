@@ -1,0 +1,17 @@
+# guardrails/wordlists/blocked_topics.txt
+#
+# OPEN ITEM — see CLAUDE.md Section 3: "Blocked topics list: needs an
+# actual list/taxonomy from the user, or a placeholder config file the
+# user fills in later." This is that placeholder file.
+#
+# Format: one topic/phrase per line, lowercase, no punctuation needed.
+# Blank lines and lines starting with '#' are ignored. Matching is
+# case-insensitive substring matching against the raw query text
+# (see guardrails/input_guardrails.py: _load_wordlist / _contains_any).
+#
+# This file ships EMPTY on purpose — the blocked_topics check is a
+# no-op (always passes) until this file has real entries. Do not
+# populate it without user sign-off on the taxonomy.
+#
+# example (commented out):
+# self-harm methods

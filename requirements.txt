@@ -1,0 +1,34 @@
+# Ingestion (Cells 1-18, hybrid path)
+pandas
+pyarrow
+huggingface_hub
+spacy
+sentence-transformers
+qdrant-client
+fastembed
+numpy
+
+# Retrieval (Cell 26-DEFS, 39, 45) -- covered by qdrant-client/sentence-transformers/fastembed above
+
+# Config / logging
+python-dotenv
+
+# API layer
+fastapi
+uvicorn[standard]
+pydantic
+
+# LLM fallback
+groq
+
+# TTS -- ElevenLabs retired this phase, kept only for reference (see CLAUDE.md §0.1),
+# not called from the live path. Left installed so tts/elevenlabs_client.py still imports.
+elevenlabs
+
+# Sarvam AI voice pipeline (STT + TTS, realtime over websocket) -- NEW this phase.
+# stt/sarvam_stt_client.py and tts/sarvam_tts_client.py talk to Sarvam directly over
+# raw websockets (no official SDK dependency), per CLAUDE.md's provider-isolation note.
+websockets
+
+# spaCy English model -- install separately after the above:
+#   python -m spacy download en_core_web_sm
