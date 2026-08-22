@@ -39,7 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 
 # Only for CPU
-# RUN pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu  
+RUN pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu  
 
 RUN pip install --no-cache-dir -r requirements.txt \
     && python -m spacy download en_core_web_sm
