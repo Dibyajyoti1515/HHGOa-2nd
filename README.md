@@ -10,6 +10,31 @@ rather than free-form generation.
 
 ---
 
+---
+
+# 📸 Screenshots
+
+<table>
+  <tr>
+    <td><img src="assets/screenshot1.png" width="400" alt="Screenshot 1"/></td>
+    <td><img src="assets/screenshot2.png" width="400" alt="Screenshot 2"/></td>
+  </tr>
+  <tr>
+    <td><img src="assets/screenshot3.png" width="400" alt="Screenshot 3"/></td>
+    <td><img src="assets/screenshot4.png" width="400" alt="Screenshot 4"/></td>
+  </tr>
+</table>
+
+---
+
+# 🎥 Demo Videos
+
+▶️ **Demo video:** [Watch on YouTube](https://youtu.be/NRk2RrDgetk)
+
+▶️ **Pipeline breakdown:** [Watch on YouTube](https://youtu.be/VLgyeyVodfw)
+
+---
+
 ## Table of contents
 
 - [HH Goa 2026 Task 2 — requirements checklist](#hh-goa-2026-task-2--requirements-checklist)
