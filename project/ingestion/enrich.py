@@ -1,29 +1,83 @@
 """
-ingestion/enrich.py
+project/ingestion/enrich.py
 
-Ported from Cell 6 of Update_version_2.ipynb ("Enrich: regex years +
-spaCy NER"). YEAR_RE is the same regex constant defined in the
-notebook's Cell 1. Logic unchanged.
+Regex year extraction + spaCy NER enrichment.
 """
 
 import re
 
 import pandas as pd
 
-YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
+
+YEAR_RE = re.compile(
+    r"\b(1[89]\d{2}|20\d{2})\b"
+)
 
 
-def enrich(df: pd.DataFrame) -> pd.DataFrame:
+def enrich(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+
     import spacy
-    nlp = spacy.load("en_core_web_sm")
-    year_mentions, ppl, orgs, locs = [], [], [], []
-    for doc_text in nlp.pipe(df["text_en"].fillna("").tolist(), batch_size=256):
-        year_mentions.append([int(y) for y in YEAR_RE.findall(doc_text.text)])
-        ppl.append([e.text for e in doc_text.ents if e.label_ == "PERSON"])
-        orgs.append([e.text for e in doc_text.ents if e.label_ == "ORG"])
-        locs.append([e.text for e in doc_text.ents if e.label_ in ("GPE", "LOC")])
+
+    nlp = spacy.load(
+        "en_core_web_sm"
+    )
+
+    year_mentions = []
+    people = []
+    organizations = []
+    locations = []
+
+    texts = (
+        df["text_en"]
+        .fillna("")
+        .tolist()
+    )
+
+    for doc in nlp.pipe(
+        texts,
+        batch_size=256,
+    ):
+
+        year_mentions.append(
+            [
+                int(year)
+                for year in YEAR_RE.findall(
+                    doc.text
+                )
+            ]
+        )
+
+        people.append(
+            [
+                entity.text
+                for entity in doc.ents
+                if entity.label_ == "PERSON"
+            ]
+        )
+
+        organizations.append(
+            [
+                entity.text
+                for entity in doc.ents
+                if entity.label_ == "ORG"
+            ]
+        )
+
+        locations.append(
+            [
+                entity.text
+                for entity in doc.ents
+                if entity.label_ in ("GPE", "LOC")
+            ]
+        )
+
+    df = df.copy()
+
     df["year_mentions"] = year_mentions
-    df["entities_people"] = ppl
-    df["entities_orgs"] = orgs
-    df["entities_locations"] = locs
+    df["entities_people"] = people
+    df["entities_orgs"] = organizations
+    df["entities_locations"] = locations
+
     return df

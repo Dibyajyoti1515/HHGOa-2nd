@@ -95,6 +95,14 @@ class Settings:
         default_factory=lambda: os.getenv("SPARSE_MODEL", "Qdrant/bm25")
     )
 
+    INGESTION_BATCH_SIZE: int = field(
+    default_factory=lambda: _get_int("INGESTION_BATCH_SIZE", 1000)
+)
+
+    EMBED_BATCH_SIZE: int = field(
+        default_factory=lambda: _get_int("EMBED_BATCH_SIZE", 32)
+    )
+
     # ------------------------------------------------------------------
     # Retrieval — default mode + hybrid_weighted params (Cell 39)
     # ------------------------------------------------------------------
