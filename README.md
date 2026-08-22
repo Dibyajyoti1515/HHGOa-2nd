@@ -324,7 +324,7 @@ sequenceDiagram
 
 ```
 HHGoa/
-├── project/
+├── project/                   # Backend
 │   ├── api/
 │   │   ├── app.py             # FastAPI app, POST /v1/query (+TTS), GET /v1/health, router mounting
 │   │   ├── text.py            # POST /v1/text — multilingual text-only pipeline
@@ -375,7 +375,7 @@ HHGoa/
 | Text-to-Speech | Sarvam **Bulbul v3** (streamed PCM16 @ 24kHz) |
 | Translation | Sarvam Translate (query → English, answer → user language) |
 | Vector DB | Qdrant — named vectors `dense` (bge-small-en-v1.5, 384-dim) + `sparse` (BM25) |
-| LLM fallback | Groq — `llama-3.3-70b-versatile` |
+| LLM fallback | Groq — `allam-2-7b` |
 | Frontend | React + Vite + Web Audio API |
 | Orchestration | Docker Compose (qdrant / backend / frontend / ingestion profile) |
 
@@ -435,14 +435,14 @@ replies with a sequence of `{"type": "transcript"}` → `{"type": "translation"}
 ## Installation
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
-cd HHGoa
+git clone https://github.com/Dibyajyoti1515/HHGOa-2nd.git
+cd HHGoa-2nd
 
-python -m venv mlenv
+python -m venv hhenv
 # Windows PowerShell
-.\mlenv\Scripts\Activate.ps1
+.\hhenv\Scripts\Activate.ps1
 # Git Bash
-source /d/mlenv/Scripts/activate
+source /d/hhenv/Scripts/activate
 
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
@@ -614,7 +614,3 @@ Full list with defaults in `project/config/settings.py`.
 ## Security
 
 Never commit `.env`, `SARVAM_API_KEY`, or `GROQ_API_KEY`. Rotate immediately if one leaks.
-
-## License
-
-Add your project license here.
