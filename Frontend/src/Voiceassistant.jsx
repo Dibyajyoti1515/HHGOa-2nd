@@ -1,90 +1,442 @@
+// frontend/src/Voiceassistant.jsx
+//
+// HH GOA — Ask Anything
+// Central card: Text / Voice toggle, pipeline status strip, conversation history.
+//
+// Voice mode talks to the REAL backend contract:
+//   WS   /v1/voice   — mic sends raw PCM16 @ 16kHz frames, {event:"stop"} ends the turn
+//                       server replies with {type:"transcript"}, {type:"translation"},
+//                       {type:"answer"}, {type:"final"}, {type:"error"}
+//                       plus binary PCM16 @ 24kHz audio chunks (Sarvam Bulbul v3), streamed live.
+// Text mode talks to:
+//   POST /v1/text     { text, language_code } -> {
+//                        type: "text_response" | "error",
+//                        text, retrieval_query, answer, language_code,
+//                        generation_method, llm_used, top1_score,
+//                        results_count, timings
+//                      }
+//                      (this endpoint returns text only — no audio_url)
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const WS_BASE = import.meta.env.VITE_WS_BASE || "ws://localhost:8000";
 const WS_URL = `${WS_BASE}/v1/voice`;
 
-// Browser microphone -> STT
-const INPUT_SAMPLE_RATE = 16000;
+const INPUT_SAMPLE_RATE = 16000; // browser mic -> STT
+const OUTPUT_SAMPLE_RATE = 24000; // Sarvam Bulbul v3 -> browser
 
-// Sarvam Bulbul v3 -> browser
-const OUTPUT_SAMPLE_RATE = 24000;
+const STAGES = ["Listening", "Transcribing", "Retrieving", "Generating", "Speaking"];
+const STAGE_INDEX = STAGES.reduce((acc, s, i) => ({ ...acc, [s]: i }), {});
+
+// Order + labels for the per-turn latency breakdown. Anything present in the
+// backend `timings` payload that matches a key here gets a friendly label;
+// everything else is skipped so we never render noisy/duplicate fields.
+const TIMING_LABELS = [
+  // shared / voice (ws_voice.py, POST /v1/query)
+  ["stt_ms", "Transcription"],
+  ["guardrail_ms", "Guardrails"],
+  ["guardrails", "Guardrails"],
+  ["translation_to_english_ms", "Translate → EN"],
+  ["retrieval_wall_ms", "Retrieval"],
+  ["embedding_ms", "· Embedding"],
+  ["qdrant_ms", "· Vector search"],
+  ["fusion_ms", "· Fusion"],
+  ["retrieval_engine_ms", "· Retrieval engine"],
+  ["retrieval_total_ms", "· Retrieval engine"],
+  ["groq_ms", "Generation (Groq)"],
+  ["groq_call_ms", "Generation (Groq)"],
+  ["text_trim_ms", "Answer trim"],
+  ["translation_to_user_language_ms", "Translate → you"],
+  ["answer_translation_ms", "Translate → you"],
+  ["tts_ms", "Speech synthesis"],
+  ["tts_generation_ms", "Speech synthesis"],
+  ["tts_first_chunk_ms", "· First audio chunk"],
+  ["total_turn_ms", "Total"],
+  ["total_ms", "Total"],
+];
+
+let turnId = 0;
+const nextId = () => `turn-${Date.now()}-${turnId++}`;
+
+// ---------------------------------------------------------------------------
+// PCM helpers (also used to stream an uploaded file through the same socket)
+// ---------------------------------------------------------------------------
+
+function downsampleBuffer(buffer, inputSampleRate, targetSampleRate) {
+  if (targetSampleRate === inputSampleRate) return buffer;
+  const ratio = inputSampleRate / targetSampleRate;
+  const newLength = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLength);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+      accum += buffer[i];
+      count++;
+    }
+    result[offsetResult] = count > 0 ? accum / count : 0;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+}
+
+function floatTo16BitPCM(float32Array) {
+  const out = new Int16Array(float32Array.length);
+  for (let i = 0; i < float32Array.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+function formatMs(value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  return value < 1000 ? `${Math.round(value)}ms` : `${(value / 1000).toFixed(2)}s`;
+}
+
+function buildTimingItems(timings) {
+  if (!timings || typeof timings !== "object") return [];
+  return TIMING_LABELS
+    .map(([key, label]) => {
+      const raw = timings[key];
+      const formatted = formatMs(typeof raw === "number" ? raw : null);
+      const isTotal = key === "total_turn_ms" || key === "total_ms";
+      return formatted ? { key, label, value: formatted, isTotal } : null;
+    })
+    .filter(Boolean);
+}
+
+// ---------------------------------------------------------------------------
+// Small presentational pieces
+// ---------------------------------------------------------------------------
+
+function ModeToggle({ mode, onChange, disabled }) {
+  return (
+    <div className="relative grid grid-cols-2 rounded-full border border-white/10 bg-white/[0.04] p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] backdrop-blur-xl">
+      <span
+        className={`absolute inset-y-1 w-[calc(50%-4px)] rounded-full bg-gradient-to-r from-[#e8c547] to-[#f2d876] shadow-[0_2px_14px_rgba(232,197,71,0.4)] transition-transform duration-300 ease-out ${mode === "voice" ? "translate-x-[calc(100%+8px)]" : "translate-x-0"
+          }`}
+      />
+      {["text", "voice"].map((m) => (
+        <button
+          key={m}
+          type="button"
+          disabled={disabled}
+          onClick={() => onChange(m)}
+          className={`relative z-10 rounded-full px-4 py-2 font-mono-hh text-xs uppercase tracking-[0.15em] transition-colors duration-300 disabled:cursor-not-allowed disabled:opacity-50 ${mode === m ? "text-[#0b2e28]" : "text-[#f5f0e1]/60 hover:text-[#f5f0e1]"
+            }`}
+        >
+          {m === "text" ? "Text" : "Voice"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function PipelineStrip({ stage, busy }) {
+  const activeIndex = STAGES.indexOf(stage);
+  return (
+    <div className="rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] backdrop-blur-xl sm:px-5">
+      <div className="hh-scrollbar-hidden flex items-center justify-between gap-1.5 overflow-x-auto sm:gap-3">
+        {STAGES.map((s, i) => {
+          const isActive = i === activeIndex;
+          const isDone = activeIndex > i;
+          return (
+            <div key={s} className="flex flex-1 items-center last:flex-none">
+              <div className="flex flex-col items-center gap-2 px-0.5 sm:px-1">
+                <span className="relative flex h-3 w-3 items-center justify-center">
+                  {isActive && busy && (
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#e8c547]/60" />
+                  )}
+                  <span
+                    className={`relative h-1.5 w-1.5 rounded-full transition-all duration-300 ${isActive
+                        ? "scale-150 bg-[#e8c547] shadow-[0_0_10px_3px_rgba(232,197,71,0.55)]"
+                        : isDone
+                          ? "bg-[#f5f0e1]/50"
+                          : "bg-white/15"
+                      }`}
+                  />
+                </span>
+                <span
+                  className={`whitespace-nowrap font-mono-hh text-[9px] uppercase tracking-[0.18em] transition-colors duration-300 sm:text-[10px] ${isActive ? "font-bold text-[#e8c547]" : isDone ? "text-[#f5f0e1]/50" : "text-white/25"
+                    }`}
+                >
+                  {s}
+                </span>
+              </div>
+              {i < STAGES.length - 1 && (
+                <div
+                  className={`mx-1.5 mb-5 h-px flex-1 transition-colors duration-300 sm:mx-3 ${isDone ? "bg-[#f5f0e1]/30" : "bg-white/10"
+                    }`}
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function AudioBar({ src, autoPlay, isStreaming, isPlaying }) {
+  const audioRef = useRef(null);
+  const [playing, setPlaying] = useState(false);
+
+  useEffect(() => {
+    if (autoPlay && audioRef.current) {
+      audioRef.current.play().catch(() => { });
+    }
+  }, [autoPlay, src]);
+
+  const toggle = () => {
+    if (!audioRef.current) return;
+    if (playing) audioRef.current.pause();
+    else audioRef.current.play().catch(() => { });
+  };
+
+  const active = src ? playing : isPlaying;
+
+  return (
+    <div className="mt-2 flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2 backdrop-blur-md">
+      {src && (
+        <audio
+          ref={audioRef}
+          src={src}
+          onPlay={() => setPlaying(true)}
+          onPause={() => setPlaying(false)}
+          onEnded={() => setPlaying(false)}
+          className="hidden"
+        />
+      )}
+      {src ? (
+        <button
+          type="button"
+          onClick={toggle}
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[#e8c547] text-[#0b2e28] transition-transform hover:scale-105 active:scale-95"
+          aria-label={playing ? "Pause" : "Play"}
+        >
+          {playing ? (
+            <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 fill-current">
+              <rect x="3" y="2" width="3.5" height="12" />
+              <rect x="9.5" y="2" width="3.5" height="12" />
+            </svg>
+          ) : (
+            <svg viewBox="0 0 16 16" className="ml-0.5 h-3.5 w-3.5 fill-current">
+              <path d="M4 2.5v11l10-5.5z" />
+            </svg>
+          )}
+        </button>
+      ) : (
+        <span
+          className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ${isStreaming ? "bg-[#e8c547]" : "bg-white/10"
+            }`}
+        >
+          <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 fill-current text-[#0b2e28]">
+            <path d="M8 1.5a3 3 0 0 0-3 3v3.5a3 3 0 0 0 6 0V4.5a3 3 0 0 0-3-3Z" />
+            <path d="M12.5 7.5a1 1 0 1 0-2 0 2.5 2.5 0 0 1-5 0 1 1 0 1 0-2 0 4.5 4.5 0 0 0 4 4.47V13.5H6a1 1 0 1 0 0 2h4a1 1 0 1 0 0-2H8.5v-1.53a4.5 4.5 0 0 0 4-4.47Z" />
+          </svg>
+        </span>
+      )}
+      <div className="flex h-5 flex-1 items-end gap-[3px]">
+        {Array.from({ length: 24 }).map((_, i) => (
+          <span
+            key={i}
+            className="w-[3px] flex-1 rounded-full"
+            style={{
+              height: `${20 + Math.abs(Math.sin(i * 0.9)) * 80}%`,
+              animation: active ? `hh-eq 0.9s ease-in-out ${i * 0.04}s infinite alternate` : "none",
+              backgroundColor: "#f5f0e1",
+              opacity: active ? 0.8 : 0.3,
+            }}
+          />
+        ))}
+      </div>
+      {!src && (
+        <span className="shrink-0 font-mono-hh text-[9px} uppercase tracking-[0.1em] text-[#f5f0e1]/40">
+          {isStreaming ? "live" : "done"}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function TimingPanel({ items }) {
+  const [open, setOpen] = useState(false);
+  if (!items.length) return null;
+  const total = items.find((i) => i.isTotal);
+  const rest = items.filter((i) => !i.isTotal);
+
+  return (
+    <div className="mt-2 w-full rounded-xl border border-white/10 bg-white/[0.04] backdrop-blur-md">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left"
+      >
+        <span className="flex items-center gap-1.5 font-mono-hh text-[9px] uppercase tracking-[0.15em] text-[#f5f0e1]/50">
+          <svg
+            viewBox="0 0 16 16"
+            className={`h-3 w-3 fill-current transition-transform duration-200 ${open ? "rotate-90" : ""}`}
+          >
+            <path d="M6 3.5 10.5 8 6 12.5z" />
+          </svg>
+          Timing
+        </span>
+        {total && (
+          <span className="font-mono-hh text-[10px] font-bold uppercase tracking-[0.1em] text-[#e8c547]">
+            {total.value}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 border-t border-white/10 px-3 py-2.5">
+          {rest.map((item) => (
+            <div key={item.key} className="flex items-center justify-between gap-2">
+              <span className="truncate font-mono-hh text-[9px] uppercase tracking-[0.1em] text-[#f5f0e1]/40">
+                {item.label}
+              </span>
+              <span className="shrink-0 font-mono-hh text-[10px] text-[#f5f0e1]/80">{item.value}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MessageBubble({ turn, autoPlay, streamingId, playingId }) {
+  const isUser = turn.role === "user";
+  const timingItems = useMemo(() => buildTimingItems(turn.timings), [turn.timings]);
+  const isStreamingAudio = turn.id === streamingId;
+  const isPlayingAudio = turn.id === playingId;
+
+  return (
+    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+      <div className={`flex max-w-[85%] flex-col ${isUser ? "items-end" : "items-start"}`}>
+        <span className="mb-1 font-mono-hh text-[9px] uppercase tracking-[0.2em] text-[#f5f0e1]/35">
+          {isUser ? "You" : "AI"}
+        </span>
+        <div
+          className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${isUser
+              ? "rounded-tr-sm border border-[#e8c547]/25 bg-[#e8c547]/15 text-[#f5f0e1] backdrop-blur-md"
+              : "rounded-tl-sm border border-white/10 bg-white/[0.05] text-[#f5f0e1]/90 backdrop-blur-md"
+            }`}
+        >
+          {turn.text || (turn.pending ? <PendingDots /> : "")}
+        </div>
+        {(turn.audioUrl || turn.hasVoiceAudio) && (
+          <AudioBar
+            src={turn.audioUrl}
+            autoPlay={autoPlay}
+            isStreaming={isStreamingAudio}
+            isPlaying={isPlayingAudio}
+          />
+        )}
+        <TimingPanel items={timingItems} />
+      </div>
+    </div>
+  );
+}
+
+function PendingDots() {
+  return (
+    <span className="inline-flex items-center gap-1">
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          className="h-1.5 w-1.5 rounded-full bg-[#f5f0e1]/50"
+          style={{ animation: `hh-bounce 1s ease-in-out ${i * 0.15}s infinite` }}
+        />
+      ))}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
 
 export default function VoiceAssistant() {
-  const [status, setStatus] = useState("idle");
-  const [transcript, setTranscript] = useState("");
-  const [answerText, setAnswerText] = useState("");
-  const [timings, setTimings] = useState(null);
-  const [errorMsg, setErrorMsg] = useState(null);
+  const [mode, setMode] = useState("text");
+  const [conversation, setConversation] = useState([]);
+  const [error, setError] = useState("");
+  const [autoPlay, setAutoPlay] = useState(true);
 
-  const [currentStage, setCurrentStage] = useState(null);
+  // text mode
+  const [textQuery, setTextQuery] = useState("");
+  const [textLoading, setTextLoading] = useState(false);
+  const [textStage, setTextStage] = useState(null);
+
+  // voice mode
+  const [voiceStatus, setVoiceStatus] = useState("idle"); // idle | recording | processing | speaking | paused | error
+  const [voiceStage, setVoiceStage] = useState(null);
   const [isPaused, setIsPaused] = useState(false);
-
-  // ---------------------------------------------------------
-  // WebSocket
-  // ---------------------------------------------------------
+  const [streamingAudioId, setStreamingAudioId] = useState(null);
+  const [playingAudioId, setPlayingAudioId] = useState(null);
 
   const wsRef = useRef(null);
-
-  // ---------------------------------------------------------
-  // Recording
-  // ---------------------------------------------------------
-
   const recordingCtxRef = useRef(null);
   const mediaStreamRef = useRef(null);
   const processorRef = useRef(null);
   const sourceRef = useRef(null);
 
-  // ---------------------------------------------------------
-  // Playback
-  // ---------------------------------------------------------
-
   const playbackCtxRef = useRef(null);
   const playbackSourcesRef = useRef(new Set());
   const playbackTimeRef = useRef(0);
+  const audioStartedRef = useRef(false);
+  const turnFinishedRef = useRef(false); // true once server has sent "final" (all audio already streamed)
 
-  // ---------------------------------------------------------
-  // Animation
-  // ---------------------------------------------------------
+  const currentAiTurnIdRef = useRef(null);
+  const maxStageRef = useRef(-1); // guards the pipeline strip from ever going "backwards"
+  const fileInputRef = useRef(null);
 
-  const typingTimerRef = useRef(null);
+  const conversationEndRef = useRef(null);
+  useEffect(() => {
+    conversationEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [conversation]);
 
-  // ---------------------------------------------------------
-  // Helpers
-  // ---------------------------------------------------------
+  const isRecording = voiceStatus === "recording";
+  const isVoiceBusy = voiceStatus === "recording" || voiceStatus === "processing";
 
-  const clearTypingTimer = useCallback(() => {
-    if (typingTimerRef.current) {
-      clearInterval(typingTimerRef.current);
-      typingTimerRef.current = null;
+  // Forward-only stage setter: a turn's pipeline should only ever move
+  // Listening -> Transcribing -> Retrieving -> Generating -> Speaking,
+  // never jump backwards because a later message arrived out of order.
+  const advanceVoiceStage = useCallback((stage) => {
+    const idx = STAGE_INDEX[stage];
+    if (idx === undefined) return;
+    if (idx >= maxStageRef.current) {
+      maxStageRef.current = idx;
+      setVoiceStage(stage);
     }
   }, []);
 
+  const resetVoiceStage = useCallback((stage) => {
+    maxStageRef.current = STAGE_INDEX[stage] ?? -1;
+    setVoiceStage(stage);
+  }, []);
+
+  // --- cleanup helpers -------------------------------------------------------
+
   const cleanupRecording = useCallback(() => {
-    if (processorRef.current) {
+    try {
+      processorRef.current?.disconnect();
+    } catch { }
+    try {
+      sourceRef.current?.disconnect();
+    } catch { }
+    mediaStreamRef.current?.getTracks().forEach((t) => {
       try {
-        processorRef.current.disconnect();
+        t.stop();
       } catch { }
-
-      processorRef.current = null;
-    }
-
-    if (sourceRef.current) {
-      try {
-        sourceRef.current.disconnect();
-      } catch { }
-
-      sourceRef.current = null;
-    }
-
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((track) => {
-        try {
-          track.stop();
-        } catch { }
-      });
-
-      mediaStreamRef.current = null;
-    }
+    });
+    processorRef.current = null;
+    sourceRef.current = null;
+    mediaStreamRef.current = null;
   }, []);
 
   const stopPlayback = useCallback(() => {
@@ -93,1602 +445,546 @@ export default function VoiceAssistant() {
         source.stop();
       } catch { }
     });
-
     playbackSourcesRef.current.clear();
-
-    if (playbackCtxRef.current) {
-      playbackTimeRef.current =
-        playbackCtxRef.current.currentTime;
-    } else {
-      playbackTimeRef.current = 0;
-    }
+    playbackTimeRef.current = playbackCtxRef.current ? playbackCtxRef.current.currentTime : 0;
+    setPlayingAudioId(null);
   }, []);
-
-  const cleanupEverything = useCallback(() => {
-    clearTypingTimer();
-
-    cleanupRecording();
-    stopPlayback();
-
-    if (wsRef.current) {
-      try {
-        wsRef.current.close();
-      } catch { }
-
-      wsRef.current = null;
-    }
-
-    setCurrentStage(null);
-  }, [
-    clearTypingTimer,
-    cleanupRecording,
-    stopPlayback,
-  ]);
-
-  const resetTurn = useCallback(() => {
-    cleanupEverything();
-
-    setTranscript("");
-    setAnswerText("");
-    setTimings(null);
-    setErrorMsg(null);
-    setCurrentStage(null);
-    setIsPaused(false);
-    setStatus("idle");
-  }, [cleanupEverything]);
-
-  // ---------------------------------------------------------
-  // Recording AudioContext
-  // ---------------------------------------------------------
 
   const ensureRecordingCtx = useCallback(() => {
     if (!recordingCtxRef.current) {
-      recordingCtxRef.current =
-        new (
-          window.AudioContext ||
-          window.webkitAudioContext
-        )({
-          sampleRate: INPUT_SAMPLE_RATE,
-        });
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      recordingCtxRef.current = new AudioCtx({ sampleRate: INPUT_SAMPLE_RATE });
     }
-
     return recordingCtxRef.current;
   }, []);
 
-  // ---------------------------------------------------------
-  // Playback AudioContext
-  // ---------------------------------------------------------
-
   const ensurePlaybackCtx = useCallback(() => {
     if (!playbackCtxRef.current) {
-      playbackCtxRef.current =
-        new (
-          window.AudioContext ||
-          window.webkitAudioContext
-        )({
-          sampleRate: OUTPUT_SAMPLE_RATE,
-        });
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      playbackCtxRef.current = new AudioCtx({ sampleRate: OUTPUT_SAMPLE_RATE });
     }
-
     return playbackCtxRef.current;
   }, []);
 
-  // ---------------------------------------------------------
-  // Fast typewriter
-  // ---------------------------------------------------------
-
-  const animateAnswer = useCallback(
-    (text) => {
-      clearTypingTimer();
-
-      if (!text) {
-        setAnswerText("");
-        return;
-      }
-
-      setAnswerText("");
-
-      /*
-       * Fast typewriter.
-       *
-       * Target duration ~200 ms.
-       * This avoids the annoying 1-2 second artificial
-       * "loading" feeling.
-       */
-
-      const targetDuration = 200;
-
-      const interval =
-        Math.max(
-          1,
-          Math.floor(
-            targetDuration / text.length
-          )
-        );
-
-      let index = 0;
-
-      typingTimerRef.current =
-        setInterval(() => {
-          index += 1;
-
-          setAnswerText(
-            text.slice(0, index)
-          );
-
-          if (index >= text.length) {
-            clearTypingTimer();
-          }
-        }, interval);
-    },
-    [clearTypingTimer]
-  );
-
-  // ---------------------------------------------------------
-  // Audio playback
-  // ---------------------------------------------------------
+  // --- streamed PCM playback (voice mode) -------------------------------------
 
   const playChunk = useCallback(
     async (arrayBuffer) => {
       const ctx = ensurePlaybackCtx();
-
       if (ctx.state === "suspended") {
         try {
           await ctx.resume();
         } catch { }
       }
 
-      /*
-       * Sarvam Bulbul v3 is configured for
-       * linear16 / 24kHz.
-       */
+      const int16 = new Int16Array(arrayBuffer);
+      if (!int16.length) return;
 
-      const int16 = new Int16Array(
-        arrayBuffer
-      );
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
 
-      if (!int16.length) {
-        return;
-      }
+      const audioBuffer = ctx.createBuffer(1, float32.length, OUTPUT_SAMPLE_RATE);
+      audioBuffer.copyToChannel(float32, 0);
 
-      const float32 =
-        new Float32Array(int16.length);
-
-      for (
-        let i = 0;
-        i < int16.length;
-        i++
-      ) {
-        float32[i] =
-          int16[i] / 32768;
-      }
-
-      const audioBuffer =
-        ctx.createBuffer(
-          1,
-          float32.length,
-          OUTPUT_SAMPLE_RATE
-        );
-
-      audioBuffer.copyToChannel(
-        float32,
-        0
-      );
-
-      const source =
-        ctx.createBufferSource();
-
+      const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
+      source.connect(ctx.destination);
 
-      source.connect(
-        ctx.destination
-      );
-
-      const now =
-        ctx.currentTime;
-
-      const startAt = Math.max(
-        now,
-        playbackTimeRef.current
-      );
-
+      const startAt = Math.max(ctx.currentTime, playbackTimeRef.current);
       source.start(startAt);
+      playbackTimeRef.current = startAt + audioBuffer.duration;
 
-      playbackTimeRef.current =
-        startAt +
-        audioBuffer.duration;
-
-      playbackSourcesRef.current.add(
-        source
-      );
-
+      playbackSourcesRef.current.add(source);
       source.onended = () => {
-        playbackSourcesRef.current.delete(
-          source
-        );
+        playbackSourcesRef.current.delete(source);
+        if (playbackSourcesRef.current.size === 0) {
+          setPlayingAudioId((current) => (current === currentAiTurnIdRef.current ? null : current));
+          // Only the server's "final" message tells us no more chunks are
+          // coming — once that's true and playback has actually drained,
+          // the turn is genuinely over: drop the "Speaking" state and hand
+          // control back to the mic so it's ready for the next question.
+          if (turnFinishedRef.current) {
+            setStreamingAudioId((current) => (current === currentAiTurnIdRef.current ? null : current));
+            setVoiceStatus((current) => (current === "speaking" ? "idle" : current));
+            setIsPaused(false);
+          }
+        }
       };
 
-      setStatus("speaking");
+      // First chunk of a turn: mark this turn as the one actively streaming/playing.
+      if (!audioStartedRef.current) {
+        audioStartedRef.current = true;
+        advanceVoiceStage("Speaking");
+        setStreamingAudioId(currentAiTurnIdRef.current);
+      }
+      setPlayingAudioId(currentAiTurnIdRef.current);
+      setVoiceStatus("speaking");
     },
-    [ensurePlaybackCtx]
+    [ensurePlaybackCtx, advanceVoiceStage],
   );
 
-  // ---------------------------------------------------------
-  // Start recording
-  // ---------------------------------------------------------
+  // --- shared WS message handling --------------------------------------------
 
-  const startRecording = useCallback(
-    async () => {
-      try {
-        setErrorMsg(null);
-        setTranscript("");
-        setAnswerText("");
-        setTimings(null);
-        setCurrentStage("stt");
-        setIsPaused(false);
-
-        playbackTimeRef.current = 0;
-
-        const ws =
-          new WebSocket(WS_URL);
-
-        ws.binaryType =
-          "arraybuffer";
-
-        wsRef.current = ws;
-
-        ws.onopen = async () => {
+  const attachSocketHandlers = useCallback(
+    (ws) => {
+      ws.onmessage = async (event) => {
+        if (typeof event.data === "string") {
+          let msg;
           try {
-            setStatus("recording");
-
-            const stream =
-              await navigator.mediaDevices.getUserMedia(
-                {
-                  audio: {
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                  },
-                }
-              );
-
-            mediaStreamRef.current =
-              stream;
-
-            const ctx =
-              ensureRecordingCtx();
-
-            if (
-              ctx.state ===
-              "suspended"
-            ) {
-              await ctx.resume();
-            }
-
-            const source =
-              ctx.createMediaStreamSource(
-                stream
-              );
-
-            sourceRef.current =
-              source;
-
-            const processor =
-              ctx.createScriptProcessor(
-                4096,
-                1,
-                1
-              );
-
-            processorRef.current =
-              processor;
-
-            processor.onaudioprocess =
-              (event) => {
-                if (
-                  ws.readyState !==
-                  WebSocket.OPEN
-                ) {
-                  return;
-                }
-
-                const input =
-                  event.inputBuffer.getChannelData(
-                    0
-                  );
-
-                const int16 =
-                  new Int16Array(
-                    input.length
-                  );
-
-                for (
-                  let i = 0;
-                  i < input.length;
-                  i++
-                ) {
-                  const sample =
-                    Math.max(
-                      -1,
-                      Math.min(
-                        1,
-                        input[i]
-                      )
-                    );
-
-                  int16[i] =
-                    sample < 0
-                      ? sample * 0x8000
-                      : sample * 0x7fff;
-                }
-
-                ws.send(
-                  int16.buffer
-                );
-              };
-
-            source.connect(
-              processor
-            );
-
-            /*
-             * Connect to destination so Chrome
-             * continues processing the ScriptProcessor.
-             *
-             * Volume is muted through a zero-gain
-             * node rather than sending microphone
-             * audio back to the speakers.
-             */
-
-            const silentGain =
-              ctx.createGain();
-
-            silentGain.gain.value = 0;
-
-            processor.connect(
-              silentGain
-            );
-
-            silentGain.connect(
-              ctx.destination
-            );
-          } catch (error) {
-            console.error(
-              error
-            );
-
-            setErrorMsg(
-              "Microphone permission failed."
-            );
-
-            resetTurn();
-          }
-        };
-
-        // ---------------------------------------------------
-        // WebSocket messages
-        // ---------------------------------------------------
-
-        ws.onmessage = async (
-          event
-        ) => {
-          // -----------------------------------------------
-          // JSON
-          // -----------------------------------------------
-
-          if (
-            typeof event.data ===
-            "string"
-          ) {
-            let msg;
-
-            try {
-              msg = JSON.parse(
-                event.data
-              );
-            } catch {
-              return;
-            }
-
-            // ---------------------------------------------
-            // Transcript
-            // ---------------------------------------------
-
-            if (
-              msg.type ===
-              "transcript"
-            ) {
-              setTranscript(
-                msg.text || ""
-              );
-
-              setCurrentStage(
-                "retrieval"
-              );
-
-              setStatus(
-                "processing"
-              );
-
-              cleanupRecording();
-
-              return;
-            }
-
-            // ---------------------------------------------
-            // Final response
-            // ---------------------------------------------
-
-            if (
-              msg.type ===
-              "final"
-            ) {
-              setTimings(
-                msg.timings || null
-              );
-
-              /*
-               * Answer appears immediately and
-               * types in ~200ms.
-               */
-
-              animateAnswer(
-                msg.answer_text || ""
-              );
-
-              setCurrentStage(
-                "complete"
-              );
-
-              /*
-               * If audio has already completed,
-               * allow user to read it.
-               */
-
-              setStatus(
-                "speaking"
-              );
-
-              return;
-            }
-
-            // ---------------------------------------------
-            // Error
-            // ---------------------------------------------
-
-            if (
-              msg.type ===
-              "error"
-            ) {
-              setErrorMsg(
-                msg.detail ||
-                msg.error ||
-                "Something went wrong."
-              );
-
-              setCurrentStage(
-                null
-              );
-
-              setStatus(
-                "error"
-              );
-
-              cleanupRecording();
-
-              return;
-            }
+            msg = JSON.parse(event.data);
+          } catch {
+            return;
           }
 
-          // -----------------------------------------------
-          // Binary audio
-          // -----------------------------------------------
-
-          else {
-            await playChunk(
-              event.data
-            );
+          if (msg.type === "transcript") {
+            const turn = { id: nextId(), role: "user", text: msg.text || "" };
+            setConversation((prev) => [...prev, turn]);
+            advanceVoiceStage("Retrieving");
+            setVoiceStatus("processing");
+            cleanupRecording();
+            return;
           }
-        };
 
-        // ---------------------------------------------------
-        // Close
-        // ---------------------------------------------------
+          if (msg.type === "translation") {
+            advanceVoiceStage("Retrieving");
+            return;
+          }
 
-        ws.onclose = () => {
-          cleanupRecording();
+          // Server sends the answer text BEFORE audio starts streaming —
+          // show it right away as a "running" placeholder turn, then attach
+          // audio + timings once they arrive.
+          if (msg.type === "answer") {
+            advanceVoiceStage("Generating");
+            turnFinishedRef.current = false;
+            const id = nextId();
+            currentAiTurnIdRef.current = id;
+            setConversation((prev) => [
+              ...prev,
+              { id, role: "ai", text: msg.text || "", hasVoiceAudio: true, pending: false },
+            ]);
+            return;
+          }
 
-          setStatus(
-            (current) => {
-              if (
-                current ===
-                "recording" ||
-                current ===
-                "processing"
-              ) {
-                return "idle";
-              }
-
-              return current;
+          if (msg.type === "final") {
+            turnFinishedRef.current = true;
+            // Audio may have already fully drained by the time "final"
+            // lands (fast/short answers) — in that case there's nothing
+            // left to wait on, so close the turn out right here too.
+            if (playbackSourcesRef.current.size === 0) {
+              setStreamingAudioId((current) => (current === currentAiTurnIdRef.current ? null : current));
+              setVoiceStatus((current) => (current === "speaking" ? "idle" : current));
+              setIsPaused(false);
             }
-          );
-        };
+            const id = currentAiTurnIdRef.current;
+            setConversation((prev) =>
+              prev.map((t) =>
+                t.id === id
+                  ? { ...t, text: msg.answer_text ?? t.text, timings: msg.timings, hasVoiceAudio: true }
+                  : t,
+              ),
+            );
+            return;
+          }
 
-        // ---------------------------------------------------
-        // Error
-        // ---------------------------------------------------
+          if (msg.type === "error") {
+            setError(msg.detail || msg.error || "Something went wrong.");
+            setVoiceStage(null);
+            setVoiceStatus("error");
+            cleanupRecording();
+            return;
+          }
+        } else {
+          await playChunk(event.data);
+        }
+      };
 
-        ws.onerror = () => {
-          setErrorMsg(
-            `Connection error. Is the backend running on ${WS_BASE}?`
-          );
+      ws.onclose = () => {
+        cleanupRecording();
+        setStreamingAudioId((current) => (current === currentAiTurnIdRef.current ? null : current));
+        setVoiceStatus((current) => (current === "recording" || current === "processing" ? "idle" : current));
+      };
 
-          cleanupRecording();
-
-          setStatus(
-            "error"
-          );
-        };
-      } catch (error) {
-        console.error(
-          error
-        );
-
-        setErrorMsg(
-          "Unable to start voice assistant."
-        );
-
-        resetTurn();
-      }
+      ws.onerror = () => {
+        setError(`Connection error. Is the backend running on ${WS_BASE}?`);
+        cleanupRecording();
+        setVoiceStatus("error");
+      };
     },
-    [
-      animateAnswer,
-      cleanupRecording,
-      ensureRecordingCtx,
-      playChunk,
-      resetTurn,
-    ]
+    [cleanupRecording, playChunk, advanceVoiceStage],
   );
 
-  // ---------------------------------------------------------
-  // Stop recording
-  // ---------------------------------------------------------
+  // --- start / stop recording --------------------------------------------------
 
-  const stopRecording =
-    useCallback(() => {
-      if (
-        wsRef.current &&
-        wsRef.current.readyState ===
-        WebSocket.OPEN
-      ) {
-        wsRef.current.send(
-          JSON.stringify({
-            event: "stop",
-          })
-        );
-      }
+  const startRecording = useCallback(async () => {
+    try {
+      setError("");
+      resetVoiceStage("Listening");
+      setIsPaused(false);
+      audioStartedRef.current = false;
+      turnFinishedRef.current = false;
+      playbackTimeRef.current = 0;
+      currentAiTurnIdRef.current = null;
+      setStreamingAudioId(null);
+      setPlayingAudioId(null);
 
-      cleanupRecording();
+      const ws = new WebSocket(WS_URL);
+      ws.binaryType = "arraybuffer";
+      wsRef.current = ws;
+      attachSocketHandlers(ws);
 
-      setCurrentStage(
-        "processing"
-      );
+      ws.onopen = async () => {
+        try {
+          setVoiceStatus("recording");
 
-      setStatus(
-        "processing"
-      );
-    }, [cleanupRecording]);
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          });
+          mediaStreamRef.current = stream;
 
-  // ---------------------------------------------------------
-  // Pause / Resume audio
-  // ---------------------------------------------------------
+          const ctx = ensureRecordingCtx();
+          if (ctx.state === "suspended") await ctx.resume();
 
-  const togglePause =
-    useCallback(() => {
-      if (
-        playbackSourcesRef.current
-          .size === 0
-      ) {
+          const source = ctx.createMediaStreamSource(stream);
+          sourceRef.current = source;
+
+          const processor = ctx.createScriptProcessor(4096, 1, 1);
+          processorRef.current = processor;
+
+          processor.onaudioprocess = (event) => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            const input = event.inputBuffer.getChannelData(0);
+            const int16 = new Int16Array(input.length);
+            for (let i = 0; i < input.length; i++) {
+              const sample = Math.max(-1, Math.min(1, input[i]));
+              int16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+            }
+            ws.send(int16.buffer);
+          };
+
+          source.connect(processor);
+
+          // Route through a silent gain so Chrome keeps the ScriptProcessor
+          // running without echoing mic audio back to the speakers.
+          const silentGain = ctx.createGain();
+          silentGain.gain.value = 0;
+          processor.connect(silentGain);
+          silentGain.connect(ctx.destination);
+        } catch {
+          setError("Microphone permission failed.");
+          cleanupRecording();
+          setVoiceStatus("error");
+        }
+      };
+    } catch {
+      setError("Unable to start voice assistant.");
+      setVoiceStatus("error");
+    }
+  }, [attachSocketHandlers, cleanupRecording, ensureRecordingCtx, resetVoiceStage]);
+
+  const stopRecording = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ event: "stop" }));
+    }
+    cleanupRecording();
+    advanceVoiceStage("Transcribing");
+    setVoiceStatus("processing");
+  }, [cleanupRecording, advanceVoiceStage]);
+
+  const handleMicTap = () => {
+    if (isRecording) stopRecording();
+    else if (!isVoiceBusy) startRecording();
+  };
+
+  const togglePause = useCallback(() => {
+    if (playbackSourcesRef.current.size === 0 && !isPaused) return;
+    if (!isPaused) {
+      stopPlayback();
+      setIsPaused(true);
+    } else {
+      setIsPaused(false);
+    }
+  }, [isPaused, stopPlayback]);
+
+  // --- upload-a-file fallback (voice mode) -------------------------------------
+
+  const handleFileUpload = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+
+    setError("");
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      const decodeCtx = new AudioCtx();
+      const decoded = await decodeCtx.decodeAudioData(arrayBuffer.slice(0));
+      const mono = decoded.getChannelData(0);
+      const downsampled = downsampleBuffer(mono, decoded.sampleRate, INPUT_SAMPLE_RATE);
+      const pcm16 = floatTo16BitPCM(downsampled);
+      decodeCtx.close();
+
+      audioStartedRef.current = false;
+      turnFinishedRef.current = false;
+      playbackTimeRef.current = 0;
+      currentAiTurnIdRef.current = null;
+      setStreamingAudioId(null);
+      setPlayingAudioId(null);
+      resetVoiceStage("Transcribing");
+      setVoiceStatus("processing");
+
+      const ws = new WebSocket(WS_URL);
+      ws.binaryType = "arraybuffer";
+      wsRef.current = ws;
+      attachSocketHandlers(ws);
+
+      ws.onopen = () => {
+        const chunkSize = 4096;
+        for (let i = 0; i < pcm16.length; i += chunkSize) {
+          ws.send(pcm16.slice(i, i + chunkSize).buffer);
+        }
+        ws.send(JSON.stringify({ event: "stop" }));
+      };
+    } catch {
+      setError("Could not read the uploaded audio file.");
+      setVoiceStatus("error");
+    }
+  };
+
+  // --- text mode ---------------------------------------------------------------
+
+  const handleTextSubmit = async (e) => {
+    e.preventDefault();
+    const query = textQuery.trim();
+    if (!query || textLoading) return;
+
+    setError("");
+    setTextLoading(true);
+    setTextStage("Retrieving");
+    setConversation((prev) => [...prev, { id: nextId(), role: "user", text: query }]);
+    setTextQuery("");
+
+    try {
+      const res = await fetch(`${API_BASE}/v1/text`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: query, language_code: "en-IN" }),
+      });
+      if (!res.ok) throw new Error(`Request failed (${res.status})`);
+      setTextStage("Generating");
+      const data = await res.json();
+
+      if (data.type === "error") {
+        setError(data.detail || data.error || "Something went wrong.");
+        setConversation((prev) => [
+          ...prev,
+          { id: nextId(), role: "ai", text: `⚠ ${data.detail || data.error || "Request failed."}`, timings: data.timings },
+        ]);
         return;
       }
 
-      if (!isPaused) {
-        stopPlayback();
+      setConversation((prev) => [
+        ...prev,
+        {
+          id: nextId(),
+          role: "ai",
+          text: data.answer ?? "(no answer returned)",
+          timings: data.timings,
+        },
+      ]);
+    } catch (err) {
+      setError(err.message === "Failed to fetch" ? "Failed to fetch — check the backend connection." : err.message);
+    } finally {
+      setTextLoading(false);
+      setTimeout(() => setTextStage(null), 1200);
+    }
+  };
 
-        setIsPaused(true);
-        setStatus("paused");
-      } else {
-        /*
-         * Already-sent chunks cannot be reconstructed
-         * here. The user has chosen to stop listening,
-         * so we keep the answer visible and don't restart
-         * old audio.
-         */
-
-        setIsPaused(false);
-        setStatus("speaking");
-      }
-    }, [
-      isPaused,
-      stopPlayback,
-    ]);
-
-  // ---------------------------------------------------------
-  // Button
-  // ---------------------------------------------------------
-
-  const handleButtonClick =
-    () => {
-      if (
-        status === "idle" ||
-        status === "error"
-      ) {
-        startRecording();
-      } else if (
-        status === "recording"
-      ) {
-        stopRecording();
-      } else if (
-        status === "speaking" ||
-        status === "paused"
-      ) {
-        togglePause();
-      }
-    };
-
-  // ---------------------------------------------------------
-  // Cleanup
-  // ---------------------------------------------------------
+  // --- cleanup on unmount --------------------------------------------------------
 
   useEffect(() => {
     return () => {
-      resetTurn();
-
-      if (
-        recordingCtxRef.current
-      ) {
-        try {
-          recordingCtxRef.current.close();
-        } catch { }
-      }
-
-      if (
-        playbackCtxRef.current
-      ) {
-        try {
-          playbackCtxRef.current.close();
-        } catch { }
-      }
+      cleanupRecording();
+      stopPlayback();
+      try {
+        wsRef.current?.close();
+      } catch { }
+      try {
+        recordingCtxRef.current?.close();
+      } catch { }
+      try {
+        playbackCtxRef.current?.close();
+      } catch { }
     };
-  }, [resetTurn]);
+  }, [cleanupRecording, stopPlayback]);
 
-  // ---------------------------------------------------------
-  // Timing display
-  // ---------------------------------------------------------
+  const stage = mode === "text" ? textStage : voiceStage;
+  const stageBusy = mode === "text" ? textLoading : isVoiceBusy || voiceStatus === "speaking";
 
-  const timingItems =
-    useMemo(() => {
-      if (!timings) {
-        return [];
-      }
-
-      const labels = {
-        stt_ms: "Speech recognition",
-        guardrail_check_ms:
-          "Guardrails",
-        guardrails_ms:
-          "Guardrails",
-
-        retrieval_wall_ms:
-          "Retrieval",
-        retrieval_total_ms:
-          "Retrieval engine",
-        retrieval_embedding_ms:
-          "Embedding",
-        retrieval_qdrant_ms:
-          "Qdrant",
-        retrieval_fusion_ms:
-          "Fusion",
-
-        text_trim_ms:
-          "Text processing",
-        groq_call_ms:
-          "Groq generation",
-
-        tts_ms:
-          "Voice generation",
-        tts_generation_ms:
-          "Voice generation",
-
-        tts_first_chunk_ms:
-          "First audio",
-
-        total_turn_ms:
-          "Total",
-
-        stt_to_tts_gap_ms:
-          "STT → TTS",
-      };
-
-      return Object.entries(
-        timings
-      )
-        .filter(
-          ([key, value]) =>
-            typeof value ===
-            "number" &&
-            Number.isFinite(value)
-        )
-        .map(
-          ([key, value]) => ({
-            key,
-            label:
-              labels[key] ||
-              formatTimingKey(key),
-            value,
-          })
-        );
-    }, [timings]);
-
-  // ---------------------------------------------------------
-  // UI text
-  // ---------------------------------------------------------
-
-  const statusText = {
-    idle: "Tap to speak",
-    recording: "Listening",
-    processing: "Finding your answer",
-    speaking: "Answer ready",
-    paused: "Audio paused",
-    error: "Try again",
-  }[status];
+  const micHint = useMemo(() => {
+    if (voiceStatus === "recording") return "Tap to stop";
+    if (voiceStatus === "processing") return "Working…";
+    if (voiceStatus === "speaking") return isPaused ? "Paused — tap mic for a new question" : "Answering…";
+    if (voiceStatus === "error") return "Tap to try again";
+    return "Tap to speak";
+  }, [voiceStatus, isPaused]);
 
   return (
-    <div style={styles.container}>
-      {/* =====================================================
-          HERO
-      ====================================================== */}
+    <div className="relative flex w-full max-w-4xl flex-col gap-5 overflow-hidden rounded-3xl border border-white/10 bg-white/[0.05] p-5 shadow-[0_25px_70px_rgba(0,0,0,0.45),inset_0_1px_0_rgba(255,255,255,0.08)] backdrop-blur-2xl sm:p-8 lg:p-10">
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-[#e8c547]/[0.06] via-transparent to-[#ff2d78]/[0.04]" />
+      <ModeToggle mode={mode} onChange={setMode} disabled={isVoiceBusy} />
 
-      <div style={styles.hero}>
+      {/* input area */}
+      <div className="relative min-h-[92px]">
         <div
-          style={{
-            ...styles.orb,
-            ...(status ===
-              "recording"
-              ? styles.orbRecording
-              : {}),
-            ...(status ===
-              "processing"
-              ? styles.orbProcessing
-              : {}),
-            ...(status ===
-              "speaking"
-              ? styles.orbSpeaking
-              : {}),
-          }}
+          className={`transition-all duration-300 ${mode === "text" ? "translate-x-0 opacity-100" : "pointer-events-none absolute inset-0 -translate-x-2 opacity-0"
+            }`}
         >
-          <button
-            onClick={
-              handleButtonClick
-            }
-            style={
-              styles.mainButton
-            }
-            aria-label={
-              statusText
-            }
-          >
-            <MicIcon
-              status={status}
+          <span className="mb-2 block font-mono-hh text-[10px] uppercase tracking-[0.2em] text-[#f5f0e1]/40">
+            Text Query
+          </span>
+          <form onSubmit={handleTextSubmit} className="flex items-center gap-2">
+            <input
+              type="text"
+              value={textQuery}
+              onChange={(e) => setTextQuery(e.target.value)}
+              placeholder="Ask about anything in Goa…"
+              className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-4 py-3 text-sm text-[#f5f0e1] placeholder:text-[#f5f0e1]/30 outline-none backdrop-blur-md transition-colors focus:border-[#e8c547]/50 focus:bg-white/[0.06]"
             />
-          </button>
+            <button
+              type="submit"
+              disabled={textLoading || !textQuery.trim()}
+              className="shrink-0 rounded-xl bg-[#e8c547] px-5 py-3 font-mono-hh text-xs font-bold uppercase tracking-[0.15em] text-[#0b2e28] transition-transform hover:scale-[1.03] active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:scale-100"
+            >
+              {textLoading ? "Asking…" : "Ask AI"}
+            </button>
+          </form>
         </div>
 
-        <div style={styles.statusTitle}>
-          {statusText}
-        </div>
+        <div
+          className={`transition-all duration-300 ${mode === "voice" ? "translate-x-0 opacity-100" : "pointer-events-none absolute inset-0 translate-x-2 opacity-0"
+            }`}
+        >
+          <span className="mb-3 block text-center font-mono-hh text-[10px] uppercase tracking-[0.2em] text-[#f5f0e1]/40">
+            Voice Query
+          </span>
+          <div className="flex flex-col items-center gap-3">
+            <button
+              type="button"
+              onClick={voiceStatus === "speaking" ? togglePause : handleMicTap}
+              disabled={voiceStatus === "processing"}
+              className="relative flex h-20 w-20 items-center justify-center rounded-full transition-transform active:scale-95 disabled:cursor-wait"
+              aria-label={micHint}
+            >
+              {isRecording &&
+                [0, 0.5, 1].map((delay) => (
+                  <span
+                    key={delay}
+                    className="absolute inset-0 rounded-full border-2"
+                    style={{ borderColor: "#ff2d78", animation: `hh-ripple 1.8s ease-out ${delay}s infinite` }}
+                  />
+                ))}
+              {voiceStatus === "processing" && (
+                <span
+                  className="absolute inset-[-3px] rounded-full border-2 border-transparent border-t-[#e8c547]"
+                  style={{ animation: "hh-spin 0.9s linear infinite" }}
+                />
+              )}
+              <span
+                className={`flex h-16 w-16 items-center justify-center rounded-full transition-colors duration-300 ${isRecording ? "bg-[#ff2d78]" : voiceStatus === "processing" ? "bg-[#e8c547]/50" : "bg-[#e8c547]"
+                  }`}
+              >
+                {isRecording ? (
+                  <svg viewBox="0 0 24 24" className="h-6 w-6 fill-[#0b2e28]">
+                    <rect x="6" y="6" width="12" height="12" rx="2" />
+                  </svg>
+                ) : voiceStatus === "speaking" ? (
+                  isPaused ? (
+                    <svg viewBox="0 0 24 24" className="ml-0.5 h-7 w-7 fill-[#0b2e28]">
+                      <path d="M8 5v14l11-7z" />
+                    </svg>
+                  ) : (
+                    <svg viewBox="0 0 24 24" className="h-7 w-7 fill-[#0b2e28]">
+                      <rect x="6" y="5" width="4" height="14" rx="1" />
+                      <rect x="14" y="5" width="4" height="14" rx="1" />
+                    </svg>
+                  )
+                ) : (
+                  <svg viewBox="0 0 24 24" className="h-7 w-7 fill-[#0b2e28]">
+                    <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3Z" />
+                    <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.93V20H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.07A7 7 0 0 0 19 11Z" />
+                  </svg>
+                )}
+              </span>
+            </button>
+            <span className="font-mono-hh text-[10px] uppercase tracking-[0.15em] text-[#f5f0e1]/40">
+              {micHint}
+            </span>
 
-        <div style={styles.statusSubtitle}>
-          {status ===
-            "recording"
-            ? "Speak naturally, then tap stop"
-            : status ===
-              "processing"
-              ? "Searching the knowledge base…"
-              : status ===
-                "speaking"
-                ? "You can pause the voice and read"
-                : status ===
-                  "paused"
-                  ? "Audio paused · answer remains visible"
-                  : "Ask anything from the knowledge base"}
+            <label className="mt-1 cursor-pointer font-mono-hh text-[10px] uppercase tracking-[0.15em] text-[#f5f0e1]/40 underline decoration-white/20 underline-offset-4 transition-colors hover:text-[#e8c547]">
+              Upload audio file
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="audio/*"
+                onChange={handleFileUpload}
+                disabled={isVoiceBusy}
+                className="hidden"
+              />
+            </label>
+          </div>
         </div>
       </div>
 
-      {/* =====================================================
-          LIVE PIPELINE
-      ====================================================== */}
+      {/* pipeline status strip */}
+      <div>
+        <span className="mb-2 block font-mono-hh text-[10px] uppercase tracking-[0.2em] text-[#f5f0e1]/40">
+          Pipeline Status
+        </span>
+        <PipelineStrip stage={stage} busy={stageBusy} />
+      </div>
 
-      {status ===
-        "processing" && (
-          <div style={styles.pipeline}>
-            <Stage
-              label="Speech"
-              active={
-                currentStage ===
-                "stt"
-              }
-              done={
-                Boolean(
-                  transcript
-                )
-              }
-            />
-
-            <StageLine />
-
-            <Stage
-              label="Search"
-              active={
-                currentStage ===
-                "retrieval"
-              }
-              done={false}
-            />
-
-            <StageLine />
-
-            <Stage
-              label="Answer"
-              active={false}
-              done={false}
-            />
-
-            <StageLine />
-
-            <Stage
-              label="Voice"
-              active={false}
-              done={false}
-            />
-          </div>
-        )}
-
-      {/* =====================================================
-          ERROR
-      ====================================================== */}
-
-      {errorMsg && (
-        <div style={styles.errorCard}>
-          <div style={styles.errorIcon}>
-            !
-          </div>
-
-          <div>
-            <div
-              style={
-                styles.errorTitle
-              }
-            >
-              Something went wrong
-            </div>
-
-            <div
-              style={
-                styles.errorText
-              }
-            >
-              {errorMsg}
-            </div>
-          </div>
-        </div>
+      {/* error */}
+      {error && (
+        <p className="rounded-lg border border-[#ff2d78]/30 bg-[#ff2d78]/10 px-3 py-2 text-xs text-[#ff2d78]">
+          {error}
+        </p>
       )}
 
-      {/* =====================================================
-          RESULT
-      ====================================================== */}
-
-      {(transcript ||
-        answerText) && (
-          <div
-            style={
-              styles.resultCard
-            }
-          >
-            {/* User question */}
-
-            {transcript && (
-              <div
-                style={
-                  styles.questionSection
-                }
-              >
-                <div
-                  style={
-                    styles.sectionLabel
-                  }
-                >
-                  YOU ASKED
-                </div>
-
-                <div
-                  style={
-                    styles.questionText
-                  }
-                >
-                  {transcript}
-                </div>
-              </div>
-            )}
-
-            {/* Divider */}
-
-            {answerText && (
-              <>
-                <div
-                  style={
-                    styles.divider
-                  }
-                />
-
-                <div
-                  style={
-                    styles.answerSection
-                  }
-                >
-                  <div
-                    style={
-                      styles.answerHeader
-                    }
-                  >
-                    <div
-                      style={
-                        styles.sectionLabel
-                      }
-                    >
-                      ANSWER
-                    </div>
-
-                    {(status ===
-                      "speaking" ||
-                      status ===
-                      "paused") && (
-                        <button
-                          onClick={
-                            togglePause
-                          }
-                          style={
-                            styles.pauseButton
-                          }
-                        >
-                          <PauseIcon
-                            paused={
-                              isPaused
-                            }
-                          />
-
-                          {isPaused
-                            ? "Resume"
-                            : "Pause"}
-                        </button>
-                      )}
-                  </div>
-
-                  <div
-                    style={
-                      styles.answerText
-                    }
-                  >
-                    {answerText}
-                  </div>
-                </div>
-              </>
-            )}
-
-            {/* =================================================
-              TIMINGS
-          ================================================== */}
-
-            {timings && (
-              <div
-                style={
-                  styles.timingPanel
-                }
-              >
-                <div
-                  style={
-                    styles.timingHeader
-                  }
-                >
-                  <span>
-                    Performance
-                  </span>
-
-                  {timings.total_turn_ms !=
-                    null && (
-                      <strong>
-                        {formatMs(
-                          timings.total_turn_ms
-                        )}
-                      </strong>
-                    )}
-                </div>
-
-                <div
-                  style={
-                    styles.timingGrid
-                  }
-                >
-                  {timingItems.map(
-                    (item) => (
-                      <div
-                        key={
-                          item.key
-                        }
-                        style={
-                          styles.timingItem
-                        }
-                      >
-                        <span>
-                          {item.label}
-                        </span>
-
-                        <strong>
-                          {formatMs(
-                            item.value
-                          )}
-                        </strong>
-                      </div>
-                    )
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-      {/* =====================================================
-          RESET
-      ====================================================== */}
-
-      {(answerText ||
-        transcript ||
-        status ===
-        "paused") && (
-          <button
-            onClick={resetTurn}
-            style={
-              styles.resetButton
-            }
-          >
-            New question
-          </button>
-        )}
-    </div>
-  );
-}
-
-// =============================================================
-// Stage
-// =============================================================
-
-function Stage({
-  label,
-  active,
-  done,
-}) {
-  return (
-    <div
-      style={{
-        ...styles.stage,
-        ...(active
-          ? styles.stageActive
-          : {}),
-      }}
-    >
-      <div
-        style={{
-          ...styles.stageDot,
-          ...(done
-            ? styles.stageDone
-            : {}),
-          ...(active
-            ? styles.stageActiveDot
-            : {}),
-        }}
-      >
-        {done ? "✓" : ""}
+      {/* conversation */}
+      <div>
+        <div className="mb-2 flex items-center justify-between">
+          <span className="font-mono-hh text-[10px] uppercase tracking-[0.2em] text-[#f5f0e1]/40">
+            Conversation
+          </span>
+          <label className="flex items-center gap-1.5 font-mono-hh text-[9px] uppercase tracking-[0.15em] text-[#f5f0e1]/40">
+            <input
+              type="checkbox"
+              checked={autoPlay}
+              onChange={(e) => setAutoPlay(e.target.checked)}
+              className="h-3 w-3 accent-[#e8c547]"
+            />
+            Autoplay
+          </label>
+        </div>
+        <div className="hh-scrollbar flex max-h-72 flex-col gap-3 overflow-y-auto rounded-xl border border-white/10 bg-white/[0.02] p-3 backdrop-blur-md">
+          {conversation.length === 0 ? (
+            <p className="py-6 text-center font-mono-hh text-[11px] uppercase tracking-[0.15em] text-[#f5f0e1]/25">
+              No questions yet — start typing or tap the mic
+            </p>
+          ) : (
+            conversation.map((turn) => (
+              <MessageBubble
+                key={turn.id}
+                turn={turn}
+                autoPlay={autoPlay}
+                streamingId={streamingAudioId}
+                playingId={playingAudioId}
+              />
+            ))
+          )}
+          <div ref={conversationEndRef} />
+        </div>
       </div>
-
-      <span>
-        {label}
-      </span>
     </div>
   );
 }
-
-function StageLine() {
-  return (
-    <div
-      style={
-        styles.stageLine
-      }
-    />
-  );
-}
-
-// =============================================================
-// Icons
-// =============================================================
-
-function MicIcon({
-  status,
-}) {
-  if (
-    status ===
-    "recording"
-  ) {
-    return (
-      <svg
-        width="28"
-        height="28"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-      >
-        <rect
-          x="6"
-          y="6"
-          width="12"
-          height="12"
-          rx="2"
-        />
-      </svg>
-    );
-  }
-
-  return (
-    <svg
-      width="28"
-      height="28"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-    >
-      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-      <line
-        x1="12"
-        y1="19"
-        x2="12"
-        y2="23"
-      />
-    </svg>
-  );
-}
-
-function PauseIcon({
-  paused,
-}) {
-  if (paused) {
-    return (
-      <svg
-        width="14"
-        height="14"
-        viewBox="0 0 24 24"
-        fill="currentColor"
-      >
-        <path d="M8 5v14l11-7z" />
-      </svg>
-    );
-  }
-
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="currentColor"
-    >
-      <rect
-        x="6"
-        y="5"
-        width="4"
-        height="14"
-        rx="1"
-      />
-      <rect
-        x="14"
-        y="5"
-        width="4"
-        height="14"
-        rx="1"
-      />
-    </svg>
-  );
-}
-
-// =============================================================
-// Formatting
-// =============================================================
-
-function formatMs(value) {
-  if (
-    value === null ||
-    value === undefined ||
-    !Number.isFinite(value)
-  ) {
-    return "—";
-  }
-
-  if (value < 1000) {
-    return `${Math.round(
-      value
-    )} ms`;
-  }
-
-  return `${(
-    value / 1000
-  ).toFixed(2)} s`;
-}
-
-function formatTimingKey(
-  key
-) {
-  return key
-    .replace(/_ms$/, "")
-    .replace(/_/g, " ")
-    .replace(
-      /\b\w/g,
-      (char) =>
-        char.toUpperCase()
-    );
-}
-
-// =============================================================
-// Styles
-// =============================================================
-
-const styles = {
-  container: {
-    width: "100%",
-    maxWidth: 820,
-    margin: "0 auto",
-    padding:
-      "clamp(20px, 4vw, 48px) clamp(12px, 3vw, 32px) 60px",
-    boxSizing: "border-box",
-    fontFamily:
-      "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-    color: "#111827",
-  },
-
-  // -----------------------------------------------------------
-  // Hero
-  // -----------------------------------------------------------
-
-  hero: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    textAlign: "center",
-    marginBottom: 32,
-  },
-
-  orb: {
-    width: 108,
-    height: 108,
-    borderRadius: "50%",
-    padding: 8,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    background:
-      "linear-gradient(135deg, #eef2ff, #f5f3ff)",
-    boxShadow:
-      "0 12px 40px rgba(79,70,229,.12)",
-    transition:
-      "transform .2s ease, box-shadow .2s ease",
-  },
-
-  orbRecording: {
-    transform: "scale(1.05)",
-    boxShadow:
-      "0 12px 45px rgba(220,38,38,.28)",
-  },
-
-  orbProcessing: {
-    boxShadow:
-      "0 12px 45px rgba(79,70,229,.22)",
-  },
-
-  orbSpeaking: {
-    boxShadow:
-      "0 12px 45px rgba(37,99,235,.22)",
-  },
-
-  mainButton: {
-    width: 92,
-    height: 92,
-    borderRadius: "50%",
-    border: "none",
-    background:
-      "#111827",
-    color: "#fff",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    cursor: "pointer",
-    boxShadow:
-      "0 8px 25px rgba(17,24,39,.22)",
-    transition:
-      "transform .18s ease, background .18s ease",
-  },
-
-  statusTitle: {
-    marginTop: 18,
-    fontSize: 18,
-    fontWeight: 650,
-    letterSpacing:
-      "-0.02em",
-  },
-
-  statusSubtitle: {
-    marginTop: 6,
-    color: "#9ca3af",
-    fontSize: 13,
-  },
-
-  // -----------------------------------------------------------
-  // Pipeline
-  // -----------------------------------------------------------
-
-  pipeline: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 8,
-    margin:
-      "0 auto 24px",
-    padding:
-      "12px 16px",
-    border:
-      "1px solid #eef0f4",
-    borderRadius: 999,
-    background:
-      "rgba(255,255,255,.8)",
-    boxShadow:
-      "0 6px 24px rgba(17,24,39,.05)",
-  },
-
-  stage: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-    fontSize: 11,
-    color: "#9ca3af",
-    whiteSpace: "nowrap",
-  },
-
-  stageActive: {
-    color: "#4f46e5",
-    fontWeight: 600,
-  },
-
-  stageDot: {
-    width: 16,
-    height: 16,
-    borderRadius: "50%",
-    border:
-      "1.5px solid #d1d5db",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: 9,
-  },
-
-  stageDone: {
-    background: "#111827",
-    color: "#fff",
-    borderColor:
-      "#111827",
-  },
-
-  stageActiveDot: {
-    borderColor:
-      "#4f46e5",
-    boxShadow:
-      "0 0 0 3px rgba(79,70,229,.1)",
-  },
-
-  stageLine: {
-    width: 18,
-    height: 1,
-    background:
-      "#e5e7eb",
-  },
-
-  // -----------------------------------------------------------
-  // Result
-  // -----------------------------------------------------------
-
-  resultCard: {
-    background: "#fff",
-    border:
-      "1px solid #edf0f4",
-    borderRadius: 20,
-    overflow: "hidden",
-    boxShadow:
-      "0 12px 40px rgba(17,24,39,.055)",
-  },
-
-  questionSection: {
-    padding:
-      "20px 22px 18px",
-  },
-
-  sectionLabel: {
-    fontSize: 10,
-    fontWeight: 700,
-    letterSpacing:
-      ".12em",
-    color: "#9ca3af",
-    marginBottom: 7,
-  },
-
-  questionText: {
-    fontSize: 15,
-    lineHeight: 1.55,
-    color: "#374151",
-  },
-
-  divider: {
-    height: 1,
-    background:
-      "#f0f1f3",
-  },
-
-  answerSection: {
-    padding:
-      "20px 22px 22px",
-  },
-
-  answerHeader: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent:
-      "space-between",
-    gap: 12,
-  },
-
-  answerText: {
-    marginTop: 10,
-    fontSize: 16,
-    lineHeight: 1.75,
-    color: "#1f2937",
-    whiteSpace:
-      "pre-wrap",
-  },
-
-  // -----------------------------------------------------------
-  // Pause
-  // -----------------------------------------------------------
-
-  pauseButton: {
-    border:
-      "1px solid #e5e7eb",
-    background: "#fff",
-    color: "#374151",
-    borderRadius: 999,
-    padding:
-      "7px 11px",
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-    fontSize: 11,
-    fontWeight: 600,
-    cursor: "pointer",
-    transition:
-      "background .15s ease",
-  },
-
-  // -----------------------------------------------------------
-  // Timings
-  // -----------------------------------------------------------
-
-  timingPanel: {
-    borderTop:
-      "1px solid #f0f1f3",
-    background:
-      "#fafafa",
-    padding:
-      "15px 22px 18px",
-  },
-
-  timingHeader: {
-    display: "flex",
-    justifyContent:
-      "space-between",
-    alignItems: "center",
-    color: "#6b7280",
-    fontSize: 11,
-    marginBottom: 11,
-  },
-
-  timingGrid: {
-    display: "grid",
-    gridTemplateColumns:
-      "repeat(auto-fit, minmax(150px, 1fr))",
-    gap: 8,
-  },
-
-  timingItem: {
-    background: "#fff",
-    border:
-      "1px solid #eef0f3",
-    borderRadius: 9,
-    padding:
-      "9px 10px",
-    display: "flex",
-    flexDirection:
-      "column",
-    gap: 3,
-  },
-
-  // -----------------------------------------------------------
-  // Error
-  // -----------------------------------------------------------
-
-  errorCard: {
-    display: "flex",
-    gap: 12,
-    alignItems: "flex-start",
-    padding: 14,
-    marginBottom: 20,
-    borderRadius: 14,
-    background: "#fff7f7",
-    border:
-      "1px solid #fee2e2",
-  },
-
-  errorIcon: {
-    width: 24,
-    height: 24,
-    borderRadius: "50%",
-    background: "#dc2626",
-    color: "#fff",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontWeight: 700,
-    fontSize: 12,
-  },
-
-  errorTitle: {
-    fontSize: 13,
-    fontWeight: 650,
-    color: "#991b1b",
-  },
-
-  errorText: {
-    marginTop: 3,
-    fontSize: 12,
-    color: "#b91c1c",
-  },
-
-  // -----------------------------------------------------------
-  // Reset
-  // -----------------------------------------------------------
-
-  resetButton: {
-    marginTop: 16,
-    border: "none",
-    background: "transparent",
-    color: "#6b7280",
-    fontSize: 12,
-    cursor: "pointer",
-    padding: 8,
-  },
-};

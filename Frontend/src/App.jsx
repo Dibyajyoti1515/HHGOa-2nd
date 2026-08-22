@@ -1,44 +1,27 @@
 // frontend/src/App.jsx
 
 import { useEffect, useState } from "react";
-import VoiceAssistant from "./VoiceAssistant";
+import VoiceAssistant from "./Voiceassistant";
 
-const API_BASE =
-  import.meta.env.VITE_API_BASE ||
-  "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 function useHealthCheck(intervalMs = 10000) {
-  const [health, setHealth] =
-    useState("checking");
+  const [health, setHealth] = useState("checking");
 
   useEffect(() => {
     let cancelled = false;
 
     const check = async () => {
       try {
-        const response = await fetch(
-          `${API_BASE}/v1/health`
-        );
-
-        if (!cancelled) {
-          setHealth(
-            response.ok ? "ok" : "down"
-          );
-        }
+        const response = await fetch(`${API_BASE}/v1/health`);
+        if (!cancelled) setHealth(response.ok ? "ok" : "down");
       } catch {
-        if (!cancelled) {
-          setHealth("down");
-        }
+        if (!cancelled) setHealth("down");
       }
     };
 
     check();
-
-    const interval = setInterval(
-      check,
-      intervalMs
-    );
-
+    const interval = setInterval(check, intervalMs);
     return () => {
       cancelled = true;
       clearInterval(interval);
@@ -48,34 +31,29 @@ function useHealthCheck(intervalMs = 10000) {
   return health;
 }
 
+const HEALTH_CONFIG = {
+  checking: { color: "#f5f0e1", label: "Connecting", pulse: false },
+  ok: { color: "#34d399", label: "Ready", pulse: true },
+  down: { color: "#ff2d78", label: "Backend offline", pulse: false },
+};
+
 function HealthBadge({ health }) {
-  const config = {
-    checking: {
-      color: "#9ca3af",
-      label: "Connecting",
-    },
-
-    ok: {
-      color: "#16a34a",
-      label: "Backend connected",
-    },
-
-    down: {
-      color: "#dc2626",
-      label: "Backend offline",
-    },
-  }[health];
-
+  const config = HEALTH_CONFIG[health];
   return (
-    <div style={styles.healthBadge}>
-      <span
-        style={{
-          ...styles.healthDot,
-          background: config.color,
-        }}
-      />
-
-      <span>
+    <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 backdrop-blur-sm">
+      <span className="relative flex h-2 w-2">
+        {config.pulse && (
+          <span
+            className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-75"
+            style={{ backgroundColor: config.color }}
+          />
+        )}
+        <span
+          className="relative inline-flex h-2 w-2 rounded-full"
+          style={{ backgroundColor: config.color }}
+        />
+      </span>
+      <span className="font-mono-hh text-[10px] uppercase tracking-[0.2em] text-[#f5f0e1]/70">
         {config.label}
       </span>
     </div>
@@ -86,225 +64,42 @@ export default function App() {
   const health = useHealthCheck();
 
   return (
-    <div style={styles.app}>
-      {/* =================================================
-          HEADER
-      ================================================= */}
+    <div className="relative flex min-h-screen w-full flex-col items-center bg-[#0b2e28] text-[#f5f0e1]">
+      {/* ambient background wash */}
+      <div
+        className="pointer-events-none absolute inset-0 opacity-60"
+        style={{
+          background:
+            "radial-gradient(60% 50% at 50% 0%, rgba(232,197,71,0.08), transparent 60%), radial-gradient(50% 40% at 100% 100%, rgba(255,45,120,0.06), transparent 60%)",
+        }}
+      />
 
-      <header style={styles.header}>
-        <div style={styles.brand}>
-          <div style={styles.brandIcon}>
-            ✦
-          </div>
-
-          <div>
-            <div style={styles.brandTitle}>
-              Voice Assistant
-            </div>
-
-            <div style={styles.brandSubtitle}>
-              Knowledge powered
-            </div>
-          </div>
+      {/* header */}
+      <div className="relative z-10 flex w-full max-w-2xl items-center justify-between px-4 pt-10">
+        <div>
+          <h1 className="text-2xl font-extrabold tracking-tight text-[#f5f0e1] sm:text-3xl">
+            HH GOA
+          </h1>
+          <p className="font-mono-hh text-[10px] uppercase tracking-[0.25em] text-[#f5f0e1]/50">
+            Goa, India · Ask Anything
+          </p>
         </div>
-
         <HealthBadge health={health} />
-      </header>
+      </div>
 
-      {/* =================================================
-          MAIN
-      ================================================= */}
-
-      <main style={styles.main}>
-        <div style={styles.assistantWrapper}>
-          <VoiceAssistant />
-        </div>
+      {/* main */}
+      <main className="relative z-10 flex w-full flex-1 items-center justify-center px-4 py-8">
+        <VoiceAssistant />
       </main>
 
-      {/* =================================================
-          FOOTER
-      ================================================= */}
-
-      <footer style={styles.footer}>
+      {/* footer */}
+      <footer className="relative z-10 flex items-center justify-center gap-2 px-4 pb-6 font-mono-hh text-[10px] uppercase tracking-[0.15em] text-[#f5f0e1]/30">
         <span>Sarvam STT</span>
-
-        <span style={styles.footerDot}>
-          •
-        </span>
-
+        <span className="text-[#f5f0e1]/15">•</span>
         <span>Hybrid Retrieval</span>
-
-        <span style={styles.footerDot}>
-          •
-        </span>
-
+        <span className="text-[#f5f0e1]/15">•</span>
         <span>Bulbul v3</span>
       </footer>
     </div>
   );
 }
-
-const styles = {
-  app: {
-    width: "100%",
-    minWidth: "100%",
-    minHeight: "100vh",
-
-    display: "flex",
-    flexDirection: "column",
-
-    background:
-      "radial-gradient(circle at 50% 0%, #f5f7ff 0%, #ffffff 32%, #ffffff 100%)",
-  },
-
-  // -------------------------------------------------------
-  // Header
-  // -------------------------------------------------------
-
-  header: {
-    width: "100%",
-    height: 72,
-
-    flexShrink: 0,
-
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-
-    padding:
-      "0 clamp(20px, 4vw, 56px)",
-
-    background:
-      "rgba(255,255,255,0.88)",
-
-    borderBottom:
-      "1px solid #eef0f4",
-
-    backdropFilter:
-      "blur(18px)",
-  },
-
-  brand: {
-    display: "flex",
-    alignItems: "center",
-    gap: 11,
-  },
-
-  brandIcon: {
-    width: 34,
-    height: 34,
-
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-
-    borderRadius: 10,
-
-    background: "#111827",
-    color: "#ffffff",
-
-    fontSize: 15,
-
-    boxShadow:
-      "0 5px 16px rgba(17,24,39,.16)",
-  },
-
-  brandTitle: {
-    fontSize: 14,
-    fontWeight: 700,
-    lineHeight: 1.2,
-    color: "#111827",
-  },
-
-  brandSubtitle: {
-    marginTop: 3,
-    fontSize: 10,
-    color: "#9ca3af",
-  },
-
-  healthBadge: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-
-    padding:
-      "7px 11px",
-
-    borderRadius: 999,
-
-    background:
-      "#ffffff",
-
-    border:
-      "1px solid #edf0f4",
-
-    color: "#6b7280",
-
-    fontSize: 11,
-
-    boxShadow:
-      "0 3px 12px rgba(17,24,39,.04)",
-  },
-
-  healthDot: {
-    width: 7,
-    height: 7,
-    flexShrink: 0,
-    borderRadius: "50%",
-  },
-
-  // -------------------------------------------------------
-  // Main
-  // -------------------------------------------------------
-
-  main: {
-    flex: 1,
-
-    width: "100%",
-    minWidth: 0,
-
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-
-    padding:
-      "30px 20px",
-
-    overflowY: "auto",
-  },
-
-  assistantWrapper: {
-    width: "100%",
-    maxWidth: 820,
-
-    display: "flex",
-    justifyContent: "center",
-  },
-
-  // -------------------------------------------------------
-  // Footer
-  // -------------------------------------------------------
-
-  footer: {
-    width: "100%",
-
-    flexShrink: 0,
-
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-
-    gap: 9,
-
-    padding:
-      "12px 20px 18px",
-
-    color: "#b0b5bd",
-
-    fontSize: 10,
-  },
-
-  footerDot: {
-    color: "#d1d5db",
-  },
-};

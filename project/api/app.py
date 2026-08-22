@@ -72,7 +72,14 @@ app = FastAPI(title="Hybrid Retrieval + Voice Answer API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],  # Vite dev server
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -106,10 +113,10 @@ def query(request: QueryRequest):
     retrieval_result = retrieve(request.query)
     results = retrieval_result["results"]
 
-    timing.add("retrieval_embedding_ms", retrieval_result.get("embedding_ms"))
-    timing.add("retrieval_qdrant_ms", retrieval_result.get("qdrant_ms"))
-    timing.add("retrieval_fusion_ms", retrieval_result.get("fusion_ms"))
-    timing.add("retrieval_total_ms", retrieval_result.get("total_ms"))
+    timing.record_ms("retrieval_embedding_ms", retrieval_result.get("embedding_ms"))
+    timing.record_ms("retrieval_qdrant_ms", retrieval_result.get("qdrant_ms"))
+    timing.record_ms("retrieval_fusion_ms", retrieval_result.get("fusion_ms"))
+    timing.record_ms("retrieval_total_ms", retrieval_result.get("total_ms"))
 
     top1_score = results[0].score if results else None
     logger.info(
@@ -123,20 +130,19 @@ def query(request: QueryRequest):
         source_text = results[0].payload.get("text_en", "")
         trim_result = trim_to_word_limit(source_text)
         final_text = trim_result["text"]
-        timing.add("groq_call_ms", None)
-        timing.add("text_trim_ms", trim_result["trim_ms"])
+        timing.record_ms("groq_call_ms", None)
+        timing.record_ms("text_trim_ms", trim_result["trim_ms"])
         logger.info("Confidence gate: skipped LLM (top1_score=%.4f)", top1_score)
     else:
         # Low/no confidence: let Groq compose an answer from retrieved context.
         groq_result = call_groq(request.query, results)
         final_text = groq_result["answer"]
-        timing.add("groq_call_ms", groq_result["groq_ms"])
-        timing.add("text_trim_ms", None)
+        timing.record_ms("groq_call_ms", groq_result["groq_ms"])
+        timing.record_ms("text_trim_ms", None)
         logger.info("Confidence gate: used Groq fallback (top1_score=%s)", top1_score)
 
     # ---- TTS ----
     tts_result = call_elevenlabs_tts(final_text)
-    timing.add("tts_generation_ms", tts_result["tts_ms"])
 
     audio_filename = Path(tts_result["audio_path"]).name
     audio_url = f"/audio/{audio_filename}"
