@@ -27,9 +27,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- Python deps first (separate layer, cached across code changes) ----
+# NOTE on GPU/CPU: requirements.txt installs plain "torch" from PyPI. On
+# Linux, that wheel already bundles CUDA and works on CPU-only machines
+# too -- so this ONE image runs on either. Whether it actually USES a GPU
+# at runtime depends only on whether one is visible to the container (see
+# docker-compose.gpu.yml) and DEVICE (see below) -- no separate GPU image
+# or build stage needed. This does make the image larger (~2GB) even on
+# CPU-only hosts; if you only ever run CPU, you can shrink it by changing
+# the torch line in requirements.txt to pull the CPU-only wheel instead
+# (https://download.pytorch.org/whl/cpu).
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && python -m spacy download en_core_web_sm
+
+# DEVICE: "auto" (default) picks cuda if visible, else cpu -- see
+# project/config/device.py. Override per-service in docker-compose.yml /
+# docker-compose.gpu.yml rather than here, so one image serves both cases.
+ENV DEVICE=auto
 
 # ---- Application code ----
 # Matches your actual repo layout: "project/" holds the backend

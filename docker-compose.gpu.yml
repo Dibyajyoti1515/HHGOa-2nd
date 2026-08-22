@@ -1,0 +1,42 @@
+# ============================================================
+# docker-compose.gpu.yml — OPTIONAL overlay that attaches host
+# GPU(s) to the backend and ingestion containers.
+#
+# Base docker-compose.yml deliberately does NOT include this, so
+# `docker compose up` keeps working out of the box on machines with
+# no GPU (a hard GPU device reservation with no GPU present makes
+# Docker refuse to start the container at all, not silently fall
+# back to CPU -- so it can't be baked into the base file safely).
+#
+# Requirements to actually use this file:
+#   - An NVIDIA GPU + driver on the host
+#   - NVIDIA Container Toolkit installed:
+#     https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d backend frontend
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml run --rm ingestion
+#
+# Without this file layered on top, both services still run fine --
+# project/config/device.py detects no GPU is visible and uses CPU
+# automatically. This file only changes whether a GPU IS visible.
+# ============================================================
+
+services:
+  backend:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ingestion:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

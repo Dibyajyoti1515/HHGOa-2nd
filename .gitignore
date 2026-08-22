@@ -182,3 +182,5 @@ Frontend/node_modules/
 
 Frontend/dist/
 Frontend/build/
+
+docker-compose.override.yml

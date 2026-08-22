@@ -15,6 +15,7 @@ from project.logging_system.logger import get_logger
 
 from project.ingestion.download import stream_read_parquet
 from project.ingestion.sampling import stratified_sample
+from project.ingestion.download import ensure_local_dataset
 from project.ingestion.explode import explode_msmarco_xi
 from project.ingestion.preprocess import preprocess_corpus
 from project.ingestion.enrich import enrich
@@ -44,6 +45,8 @@ def run_ingestion(data_path: str, lang_code: str = "en") -> None:
       16: write archive (parquet) + SQLite native lookup
       17: embed (dense + sparse) + upsert to Qdrant (hybrid collection)
     """
+    data_path = ensure_local_dataset(data_path)
+
     # Cell 11
     logger.info("Reading source parquet: %s", data_path)
     df = stream_read_parquet(data_path)

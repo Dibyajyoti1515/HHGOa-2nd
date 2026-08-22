@@ -8,6 +8,15 @@ qdrant-client
 fastembed
 numpy
 
+# Dense embedding model backend. Explicit (rather than left as a
+# transitive dep of sentence-transformers) so the GPU/CPU choice is
+# visible here. Default PyPI wheel on Linux bundles CUDA and runs on
+# both GPU and CPU-only hosts (see Dockerfile). For a smaller CPU-only
+# image, replace this line with:
+#   --extra-index-url https://download.pytorch.org/whl/cpu
+#   torch
+torch
+
 # Retrieval (Cell 26-DEFS, 39, 45) -- covered by qdrant-client/sentence-transformers/fastembed above
 
 # Config / logging
@@ -31,4 +40,4 @@ elevenlabs
 websockets
 
 # spaCy English model -- install separately after the above:
-#   python -m spacy download en_core_web_sm
+# python -m spacy download en_core_web_sm

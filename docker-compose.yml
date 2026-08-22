@@ -44,6 +44,10 @@ services:
       SQLITE_DB: /app/state/native_text_lookup.db
       LOG_DIR: /app/state/logs
       TTS_OUTPUT_DIR: /app/state/tts_out
+      # GPU/CPU for the dense embedding model -- "auto" works with or
+      # without docker-compose.gpu.yml layered on top; override in
+      # .env if you want to force one or the other everywhere.
+      DEVICE: ${DEVICE:-auto}
     ports:
       - "8000:8000"
     volumes:
@@ -60,10 +64,16 @@ services:
       dockerfile: Dockerfile
     container_name: hhgoa-ingestion
     entrypoint: ["./docker/entrypoint-ingestion.sh"]
-    # Adjust these flags if your project/scripts/run_ingestion.py
-    # takes different arguments -- see the note in
-    # docker/entrypoint-ingestion.sh.
-    command: ["--input", "/app/source_data/hintrain.parquet", "--lang", "en"]
+    # Path matches where Hugging Face's own directory structure puts the
+    # file (train/hintrain.parquet) under /app/source_data. If it's not
+    # there yet, ingestion/download.py's ensure_local_dataset() creates
+    # /app/source_data and downloads it from ai4bharat/MSMARCO-XI on
+    # Hugging Face automatically -- no manual download required. If you'd
+    # rather pre-place your own copy, put it at exactly this path on the
+    # host (./source_data/train/hintrain.parquet) and it'll be used as-is.
+    # Adjust these flags if your project/scripts/run_ingestion.py takes
+    # different arguments -- see the note in docker/entrypoint-ingestion.sh.
+    command: ["--input", "/app/source_data/train/hintrain.parquet", "--lang", "en"]
     env_file:
       - .env
     environment:
@@ -71,13 +81,15 @@ services:
       UNIFIED_FILE: /app/state/unified_corpus.parquet
       SQLITE_DB: /app/state/native_text_lookup.db
       LOG_DIR: /app/state/logs
+      DEVICE: ${DEVICE:-auto}
     volumes:
       - app_state:/app/state
       - hf_cache:/root/.cache/huggingface
       - fastembed_cache:/app/fastembed_cache
-      # Put your raw source parquet(s) (e.g. MSMARCO-XI/train/hintrain.parquet)
-      # on the host under ./source_data before running this service.
-      - ./source_data:/app/source_data:ro
+      # Writable (not :ro) -- the container needs to create this folder
+      # and write the downloaded parquet into it on first run. Persisted
+      # on the host so subsequent runs skip the download entirely.
+      - ./source_data:/app/source_data
     depends_on:
       - qdrant
     profiles:
