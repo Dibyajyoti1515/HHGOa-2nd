@@ -13,7 +13,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 from huggingface_hub import hf_hub_download
 
-from logging_system.logger import get_logger
+from project.logging_system.logger import get_logger
 
 logger = get_logger(__name__)
 

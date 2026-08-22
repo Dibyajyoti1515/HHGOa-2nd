@@ -20,7 +20,7 @@ first call (device availability doesn't change mid-process).
 
 import os
 
-from logging_system.logger import get_logger
+from project.logging_system.logger import get_logger
 
 logger = get_logger(__name__)
 
