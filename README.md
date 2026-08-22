@@ -423,7 +423,19 @@ pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
 
-Create `.env` from `.env.example` and fill in `SARVAM_API_KEY`, `GROQ_API_KEY`, `QDRANT_URL`.
+`.env.example` already ships with working defaults for every config value — retrieval mode,
+confidence threshold, embedding model, Qdrant collection, etc. (see
+[`project/config/settings.py`](project/config/settings.py) for what each one does). All you need
+to add are the three API keys:
+
+```bash
+cp .env.example .env
+# then open .env and fill in:
+#   SARVAM_API_KEY=
+#   GROQ_API_KEY=
+#   ELEVENLABS_API_KEY=   (only needed for the legacy POST /v1/query TTS path)
+```
+
 Never commit `.env`.
 
 ```bash
@@ -442,6 +454,8 @@ npm run dev
 ## Running with Docker
 
 ```bash
+cp .env.example .env
+# fill in SARVAM_API_KEY / GROQ_API_KEY as above, then:
 docker compose up
 ```
 Starts `qdrant` (6333/6334), `backend` (8000), `frontend` (5173). The `ingestion` service is
