@@ -1,0 +1,4 @@
+export RAG_PROJECT_ROOT=/e/HhGoa
+export EVAL_EMBEDDER_MODULE=evaluation_adapter.embedder
+export EVAL_GENERATOR_MODULE=evaluation_adapter.generator
+export OPENAI_API_KEY=
