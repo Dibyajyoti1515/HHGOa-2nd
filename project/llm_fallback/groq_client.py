@@ -60,9 +60,18 @@ def call_groq(query: str, results, model: str = None) -> dict:
                 {
                     "role": "system",
                     "content": (
-                        "Answer the user's question using only the provided context. "
-                        "Be concise and direct. If the context does not contain the "
-                        "answer, say so briefly."
+                        "You are a strict retrieval-grounded QA system.\n\n"
+            "Your ONLY source of information is the provided context.\n"
+            "Do NOT use your own world knowledge.\n"
+            "Do NOT infer an answer merely because the context is related "
+            "to the question.\n\n"
+            "First determine whether the context explicitly contains "
+            "enough information to answer the question.\n\n"
+            "If the context does NOT contain enough information, respond "
+            "with exactly:\n"
+            "NOT_SUPPORTED\n\n"
+            "If the context DOES contain enough information, answer "
+            "concisely using ONLY information present in the context."
                     ),
                 },
                 {
@@ -71,7 +80,7 @@ def call_groq(query: str, results, model: str = None) -> dict:
                 },
             ],
         )
-        answer = response.choices[0].message.content
+        answer = response.choices[0].message.content.strip()
     except Exception:
         logger.exception("Groq fallback call failed for query=%r", query)
         raise

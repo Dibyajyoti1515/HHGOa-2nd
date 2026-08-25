@@ -128,7 +128,7 @@ class Settings:
     # ------------------------------------------------------------------
     GROQ_API_KEY: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", ""))
     GROQ_MODEL: str = field(
-        default_factory=lambda: os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        default_factory=lambda: os.getenv("GROQ_MODEL", "allam-2-7b")
     )
 
     # ------------------------------------------------------------------
